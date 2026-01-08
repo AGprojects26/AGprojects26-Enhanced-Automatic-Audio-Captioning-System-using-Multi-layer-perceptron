@@ -1,0 +1,164 @@
+!pip install -q librosa soundfile tensorflow tensorflow_hub
+!pip install -q openai-whisper torch gtts
+!pip install -q nltk rouge-score
+
+import whisper
+import librosa
+import numpy as np
+import tensorflow_hub as hub
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from google.colab import files
+from gtts import gTTS
+from IPython.display import Audio, display
+
+print("Loading YAMNet...")
+yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
+
+class_map_path = yamnet.class_map_path().numpy().decode("utf-8")
+class_names = []
+with open(class_map_path, "r") as f:
+    for line in f.readlines()[1:]:
+        class_names.append(line.strip().split(",")[-1].replace('"', ''))
+
+print("YAMNet loaded ✔")
+
+print("Loading Whisper...")
+asr = whisper.load_model("tiny")
+print("Whisper loaded ✔")
+
+print("Upload audio file")
+uploaded = files.upload()
+audio_path = list(uploaded.keys())[0]
+
+y, sr = librosa.load(audio_path, sr=16000)
+print(f"Audio loaded: {audio_path}")
+
+scores, embeddings, spectrogram = yamnet(y)
+
+mean_scores = np.mean(scores, axis=0)
+top5 = np.argsort(mean_scores)[::-1][:5]
+
+print("\nTop sound classes:")
+for i in top5:
+    print(f"{class_names[i]} ({mean_scores[i]:.2f})")
+
+# Convert YAMNet embeddings to PyTorch tensor
+emb_pt = torch.tensor(embeddings.numpy()).float()
+
+orig_dim = emb_pt.shape[1]
+
+# MLP Network
+MLP = nn.Sequential(
+    nn.Linear(orig_dim, 512),
+    nn.ReLU(),
+    nn.Linear(512, 256)
+)
+
+with torch.no_grad():
+    mlp_out = MLP(emb_pt)
+
+print("MLP applied ✔")
+print("Original embedding shape:", emb_pt.shape)
+print("MLP output shape       :", mlp_out.shape)
+
+speech_labels = ["Speech", "Conversation", "Narration", "Babbling"]
+
+speech_score = sum(
+    mean_scores[class_names.index(lbl)]
+    for lbl in speech_labels if lbl in class_names
+)
+
+if speech_score > 0.25:
+    print("Speech detected → Whisper running...")
+    result = asr.transcribe(audio_path, fp16=False)
+    speech_text = result["text"].strip()
+else:
+    print("No speech detected")
+    speech_text = ""
+
+print("Speech text:", speech_text)
+
+labels = [class_names[i].lower() for i in top5 if mean_scores[i] > 0.25]
+labels = list(dict.fromkeys(labels))
+
+def generate_caption(labels, speech=""):
+    if speech:
+        return f"The audio contains human speech saying {speech}."
+    elif labels:
+        return f"The audio contains sounds of {labels[0]} and {labels[1]}."
+    else:
+        return "The audio contains environmental sounds."
+
+caption = generate_caption(labels, speech_text)
+print("\nGenerated Caption:")
+print(caption)
+
+# Clone COCO evaluation toolkit once
+import os, sys
+if not os.path.exists("pycocoevalcap"):
+    !git clone https://github.com/salaniz/pycocoevalcap.git
+
+sys.path.append("/content/pycocoevalcap")
+
+import nltk
+nltk.download("wordnet")
+nltk.download("omw-1.4")
+
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+from cider.cider import Cider
+from spice.spice import Spice
+
+# Reference caption (ground truth)
+reference_caption = "The audio contains human speech saying good morning."
+generated_caption = caption.lower()
+
+# Tokenization
+ref_tokens = reference_caption.split()
+gen_tokens = generated_caption.split()
+smooth = SmoothingFunction().method1
+
+# BLEU
+BLEU_1 = sentence_bleu([ref_tokens], gen_tokens, weights=(1,0,0,0), smoothing_function=smooth)
+BLEU_2 = sentence_bleu([ref_tokens], gen_tokens, weights=(0.5,0.5,0,0), smoothing_function=smooth)
+BLEU_3 = sentence_bleu([ref_tokens], gen_tokens, weights=(0.33,0.33,0.33,0), smoothing_function=smooth)
+BLEU_4 = sentence_bleu([ref_tokens], gen_tokens, weights=(0.25,0.25,0.25,0.25), smoothing_function=smooth)
+
+# METEOR
+METEOR = meteor_score([ref_tokens], gen_tokens)
+
+# ROUGE-L
+scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+ROUGE_L = scorer.score(reference_caption, generated_caption)["rougeL"].fmeasure
+
+# CIDEr
+CIDEr, _ = Cider().compute_score(
+    {0: [reference_caption]},
+    {0: [generated_caption]}
+)
+
+# SPICE (safe)
+try:
+    SPICE, _ = Spice().compute_score(
+        {0: [reference_caption]},
+        {0: [generated_caption]}
+    )
+except Exception:
+    SPICE = "Java Error (Skipped)"
+
+print("\n==============================")
+print(" FINAL EVALUATION METRICS")
+print("==============================")
+print(f"BLEU-1   : {BLEU_1:.4f}")
+print(f"BLEU-2   : {BLEU_2:.4f}")
+print(f"BLEU-3   : {BLEU_3:.4f}")
+print(f"BLEU-4   : {BLEU_4:.4f}")
+print(f"METEOR   : {METEOR:.4f}")
+print(f"ROUGE-L  : {ROUGE_L:.4f}")
+print(f"CIDEr    : {CIDEr:.4f}")
+print(f"SPICE    : {SPICE}")

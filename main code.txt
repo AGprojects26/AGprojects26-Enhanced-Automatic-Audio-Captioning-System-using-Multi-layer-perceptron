@@ -1,0 +1,216 @@
+# =====================================================
+# INSTALL DEPENDENCIES
+# =====================================================
+!pip install -q librosa soundfile tensorflow tensorflow_hub
+!pip install -q openai-whisper torch gtts
+
+# =====================================================
+# IMPORTS
+# =====================================================
+import whisper
+import librosa
+import numpy as np
+import tensorflow_hub as hub
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from google.colab import files
+from gtts import gTTS
+from IPython.display import Audio, display
+
+# =====================================================
+# 1) LOAD YAMNET
+# =====================================================
+print("Loading YAMNet...")
+yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
+
+class_map_path = yamnet.class_map_path().numpy().decode("utf-8")
+class_names = []
+with open(class_map_path, "r") as f:
+    for line in f.readlines()[1:]:
+        class_names.append(line.strip().split(",")[-1].replace('"', ''))
+
+print("YAMNet loaded ✔")
+
+# =====================================================
+# 2) LOAD WHISPER
+# =====================================================
+print("Loading Whisper (tiny)...")
+asr = whisper.load_model("tiny")
+print("Whisper loaded ✔")
+
+# =====================================================
+# 3) UPLOAD & LOAD AUDIO
+# =====================================================
+print("Upload audio file")
+uploaded = files.upload()
+audio_path = list(uploaded.keys())[0]
+
+y, sr = librosa.load(audio_path, sr=16000)
+print(f"Audio loaded: {audio_path} ({len(y)/sr:.2f} seconds)")
+
+# =====================================================
+# 4) YAMNET PREDICTION
+# =====================================================
+scores, embeddings, spectrogram = yamnet(y)
+
+mean_scores = np.mean(scores, axis=0)
+top5 = np.argsort(mean_scores)[::-1][:5]
+
+print("\n===================")
+print(" CLEAN TOP LABELS ")
+print("===================")
+for i in top5:
+    print(f"{class_names[i]} ({mean_scores[i]:.2f})")
+
+# =====================================================
+# 5) MLP FEATURE LEARNING + EFFECT ANALYSIS (KEY SECTION)
+# =====================================================
+emb_pt = torch.tensor(embeddings.numpy()).float()
+
+# ---- BEFORE MLP (Raw YAMNet Embeddings)
+orig_dim = emb_pt.shape[-1]
+orig_var = emb_pt.var(dim=0).mean().item()
+orig_norm = emb_pt.norm(dim=1).mean().item()
+
+# ---- MLP
+MLP = nn.Sequential(
+    nn.Linear(orig_dim, 512),
+    nn.ReLU(),
+    nn.Linear(512, 256)
+)
+
+with torch.no_grad():
+    mlp_out = MLP(emb_pt)
+
+# ---- AFTER MLP
+mlp_dim = mlp_out.shape[-1]
+mlp_var = mlp_out.var(dim=0).mean().item()
+mlp_norm = mlp_out.norm(dim=1).mean().item()
+
+# ---- Temporal Smoothness (Cosine Similarity)
+def avg_cosine_similarity(x):
+    return F.cosine_similarity(x[:-1], x[1:], dim=1).mean().item()
+
+orig_cos = avg_cosine_similarity(emb_pt)
+mlp_cos = avg_cosine_similarity(mlp_out)
+
+# ---- PRINT MLP EFFECT EVIDENCE
+print("\n===================================")
+print(" MLP EFFECT ANALYSIS (EVIDENCE)")
+print("===================================")
+print(f"Embedding dimension      : {orig_dim} → {mlp_dim}")
+print(f"Mean feature variance    : {orig_var:.4f} → {mlp_var:.4f}")
+print(f"Mean feature L2 norm     : {orig_norm:.4f} → {mlp_norm:.4f}")
+print(f"Temporal cosine similarity: {orig_cos:.4f} → {mlp_cos:.4f}")
+
+# =====================================================
+# 6) GRAPH ATTENTION CLASSIFIER (REPRESENTATION ONLY)
+# =====================================================
+class GraphAttention(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.W = nn.Linear(in_dim, out_dim, bias=False)
+        self.a = nn.Linear(2 * out_dim, 1, bias=False)
+        self.leakyrelu = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        N = x.size(0)
+        h = self.W(x)
+        h_i = h.unsqueeze(1).repeat(1, N, 1)
+        h_j = h.unsqueeze(0).repeat(N, 1, 1)
+        e = self.leakyrelu(self.a(torch.cat([h_i, h_j], dim=-1))).squeeze(-1)
+        alpha = torch.softmax(e, dim=1)
+        return torch.matmul(alpha, h)
+
+class GraphAC(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_classes):
+        super().__init__()
+        self.gat = GraphAttention(in_dim, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = self.gat(x)
+        x = x.mean(dim=0)
+        return self.classifier(x)
+
+graph_ac = GraphAC(
+    in_dim=256,
+    hidden_dim=128,
+    num_classes=len(class_names)
+)
+
+with torch.no_grad():
+    _ = graph_ac(mlp_out)
+
+print("\nGraph-AC forward pass completed ✔")
+
+# =====================================================
+# 7) SPEECH DETECTION (YAMNET ONLY)
+# =====================================================
+speech_labels = ["Speech", "Conversation", "Narration", "Babbling"]
+
+speech_score = 0
+for lbl in speech_labels:
+    if lbl in class_names:
+        speech_score += mean_scores[class_names.index(lbl)]
+
+print(f"\nYAMNet Speech score = {speech_score:.3f}")
+audio_has_speech = speech_score > 0.25
+
+# =====================================================
+# 8) WHISPER TRANSCRIPTION
+# =====================================================
+text = ""
+
+if audio_has_speech:
+    print("\nSpeech detected → Running Whisper...")
+    result = asr.transcribe(audio_path, fp16=False)
+    text = result.get("text", "").strip()
+else:
+    print("\nNo speech detected → Skipping Whisper")
+
+# =====================================================
+# 9) AUTOMATIC CAPTION GENERATION
+# =====================================================
+sorted_indices = sorted(top5, key=lambda i: mean_scores[i], reverse=True)
+
+labels = [
+    class_names[i].lower()
+    for i in sorted_indices
+    if mean_scores[i] >= 0.25
+]
+
+if not labels:
+    labels = [class_names[i].lower() for i in sorted_indices[:3]]
+
+labels = list(dict.fromkeys(labels))
+
+def generate_caption(labels, speech_text=""):
+    if speech_text:
+        return f"The audio contains clear human speech saying: {speech_text}"
+    labels = [l.replace("_", " ") for l in labels]
+    if len(labels) == 1:
+        return f"The audio captures the sound of {labels[0]}."
+    elif len(labels) == 2:
+        return f"The audio captures the sound of {labels[0]} and {labels[1]}."
+    else:
+        return f"The audio captures the sound of {labels[0]} with {labels[1]} and {labels[2]}."
+
+caption = generate_caption(labels, text)
+
+print("\n===================")
+print(" FINAL CAPTION ")
+print("===================")
+print(caption)
+
+# =====================================================
+# 10) TEXT-TO-SPEECH
+# =====================================================
+tts = gTTS(text=caption, lang="en")
+output_audio = "caption_output.mp3"
+tts.save(output_audio)
+
+print("\nCaption converted to speech ✔")
+display(Audio(output_audio))
+files.download(output_audio)
